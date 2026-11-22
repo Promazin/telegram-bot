@@ -12,9 +12,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  buildDigestPeriod,
+  formatCompletenessLabel,
   groupDigestEvents,
-  partitionDigestEvents,
-  DigestDeferralBuffer,
+  normalizeDigestCompleteness,
 } from "../dist/notifications/digest-grouping.js";
 import { formatDigest } from "../dist/notifications/format.js";
 
@@ -273,86 +274,106 @@ test("formatDigest grouped: mixed burst — header only for multi-event groups",
 });
 
 // ---------------------------------------------------------------------------
-// Quiet-hours-aware digest deferral
+// Incomplete digest periods
 // ---------------------------------------------------------------------------
 
-test("DigestDeferralBuffer: defers non-critical events in quiet hours, keeps critical alerts immediate, and flushes in allowed window", () => {
-  const policy = { window: { start: 22, end: 6 } };
-  const buffer = new DigestDeferralBuffer({ policy, maxEntries: 10 });
-
-  const normal1 = marketEvent(1, 2000);
-  const critical = makeEvent({
-    source: "market",
-    ledger: 2001,
-    payload: {
-      name: "claim_resolved",
-      claimId: 1,
-      category: "test",
-      creator: "GBMGZ3D6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
-    },
-  });
-  const normal2 = squadEvent(5, 2002);
-
-  // During quiet hours (23:00 UTC): critical is immediate, normal events are buffered
-  const ingest1 = buffer.ingest([normal1, critical, normal2], "2026-10-19T23:00:00Z");
-  assert.equal(ingest1.immediate.length, 1);
-  assert.equal(ingest1.immediate[0].eventId, critical.eventId);
-  assert.equal(ingest1.deferredCount, 2);
-  assert.equal(ingest1.droppedCount, 0);
-  assert.equal(buffer.size, 2);
-
-  // Still in quiet hours (05:59 UTC): flushIfAllowed returns null
-  assert.equal(buffer.flushIfAllowed("2026-10-20T05:59:00Z"), null);
-  assert.equal(buffer.size, 2);
-
-  // Allowed window (06:00 UTC): flushIfAllowed drains and groups buffered entries
-  const flushed = buffer.flushIfAllowed("2026-10-20T06:00:00Z");
-  assert.ok(flushed !== null);
-  assert.equal(flushed.events.length, 2);
-  assert.equal(flushed.groups.length, 2);
-  assert.equal(flushed.droppedCount, 0);
-  assert.equal(buffer.size, 0);
+test("normalizeDigestCompleteness: defaults to complete and deduplicates reasons", () => {
+  assert.deepEqual(normalizeDigestCompleteness(), { complete: true, reasons: [] });
+  assert.deepEqual(
+    normalizeDigestCompleteness({ complete: false, reasons: ["rpc_gap", "restart", "rpc_gap"] }),
+    { complete: false, reasons: ["rpc_gap", "restart"] },
+  );
 });
 
-test("DigestDeferralBuffer: caps accumulated entries and counts overflow drops", () => {
-  const buffer = new DigestDeferralBuffer({
-    policy: { window: { start: 22, end: 6 } },
-    maxEntries: 2,
-  });
-
-  const events = [marketEvent(1, 2100), marketEvent(1, 2101), marketEvent(2, 2102)];
-  const res = buffer.ingest(events, "2026-10-19T23:30:00Z");
-  assert.equal(res.deferredCount, 2);
-  assert.equal(res.droppedCount, 1);
-  assert.equal(res.bufferedCount, 2);
-  assert.equal(buffer.droppedCount, 1);
-
-  const flushed = buffer.flushIfAllowed("2026-10-20T06:00:00Z");
-  assert.ok(flushed !== null);
-  assert.equal(flushed.events.length, 2);
-  assert.equal(flushed.groups.length, 1);
-  assert.equal(flushed.groups[0].key, "market:1");
-  assert.equal(flushed.droppedCount, 1);
-  assert.equal(buffer.droppedCount, 0);
+test("normalizeDigestCompleteness: reasons always force complete=false even if caller passes complete=true", () => {
+  assert.deepEqual(
+    normalizeDigestCompleteness({ complete: true, reasons: ["rpc_gap"] }),
+    { complete: false, reasons: ["rpc_gap"] },
+  );
+  assert.deepEqual(
+    normalizeDigestCompleteness({ complete: false, reasons: [] }),
+    { complete: false, reasons: [] },
+  );
 });
 
-test("DigestDeferralBuffer & partitionDigestEvents: boundary and invalid maxEntries handling", () => {
-  assert.throws(
-    () => new DigestDeferralBuffer({ maxEntries: -1 }),
-    RangeError,
+test("formatCompletenessLabel: formats complete as null and incomplete reasons explicitly", () => {
+  assert.equal(formatCompletenessLabel({ complete: true, reasons: [] }), null);
+  assert.equal(
+    formatCompletenessLabel({ complete: false, reasons: ["rpc_gap"] }),
+    "Incomplete period (RPC gap)",
   );
-  assert.throws(
-    () => new DigestDeferralBuffer({ maxEntries: 1.5 }),
-    RangeError,
+  assert.equal(
+    formatCompletenessLabel({ complete: false, reasons: ["restart"] }),
+    "Incomplete period (restart)",
   );
+  assert.equal(
+    formatCompletenessLabel({ complete: false, reasons: ["rpc_gap", "restart"] }),
+    "Incomplete period (RPC gap, restart)",
+  );
+  assert.equal(
+    formatCompletenessLabel({ complete: false, reasons: [] }),
+    "Incomplete period",
+  );
+});
 
-  // Outside quiet hours, all events are immediate
-  const normal = marketEvent(3, 2200);
-  const partitioned = partitionDigestEvents(
-    [normal],
-    { window: { start: 22, end: 6 } },
-    "2026-10-20T12:00:00Z",
-  );
-  assert.equal(partitioned.immediate.length, 1);
-  assert.equal(partitioned.deferred.length, 0);
+test("buildDigestPeriod: pairs grouped events with normalized completeness metadata", () => {
+  const e1 = marketEvent(1, 1600);
+  const e2 = marketEvent(1, 1601);
+  const period = buildDigestPeriod([e1, e2], { complete: false, reasons: ["rpc_gap"] });
+
+  assert.equal(period.eventCount, 2);
+  assert.equal(period.groups.length, 1);
+  assert.deepEqual(period.completeness, { complete: false, reasons: ["rpc_gap"] });
+});
+
+test("formatDigest: labels RPC gap period and marks count as partial in flat mode", () => {
+  const e1 = marketEvent(1, 1700);
+  const e2 = squadEvent(2, 1701);
+  const result = formatDigest([e1, e2], {
+    completeness: { complete: false, reasons: ["rpc_gap"] },
+  });
+
+  assert.ok(result !== null);
+  assert.ok(result.includes("Incomplete period \\(RPC gap\\)"), "should label RPC gap");
+  assert.ok(result.includes("2 observed events, partial"), "should mark count as partial");
+  assert.ok(!result.includes("events in this cycle"), "must not present partial count as complete cycle");
+});
+
+test("formatDigest: labels restart + RPC gap in grouped mode and preserves grouping", () => {
+  const e1 = marketEvent(4, 1800);
+  const e2 = marketEvent(4, 1801);
+  const result = formatDigest([e1, e2], {
+    grouped: true,
+    completeness: { complete: false, reasons: ["rpc_gap", "restart"] },
+  });
+
+  assert.ok(result !== null);
+  assert.ok(result.includes("Incomplete period \\(RPC gap, restart\\)"));
+  assert.ok(result.includes("2 observed events, partial"));
+  const indented = result.split("\n").filter((l) => l.startsWith("  ·"));
+  assert.equal(indented.length, 2, "grouped lines should still be indented");
+});
+
+test("formatDigest: boundary case — 0 observed events in an incomplete period returns explicit partial notice", () => {
+  const completeEmpty = formatDigest([], { completeness: { complete: true, reasons: [] } });
+  assert.equal(completeEmpty, null);
+
+  const incompleteEmpty = formatDigest([], {
+    completeness: { complete: false, reasons: ["rpc_gap"] },
+  });
+  assert.ok(incompleteEmpty !== null);
+  assert.ok(incompleteEmpty.includes("Incomplete period \\(RPC gap\\)"));
+  assert.ok(incompleteEmpty.includes("0 observed events, partial"));
+});
+
+test("formatDigest: boundary case — contradictory complete=true with reasons never renders as complete", () => {
+  const e = marketEvent(8, 1900);
+  const result = formatDigest([e], {
+    completeness: { complete: true, reasons: ["restart"] },
+  });
+
+  assert.ok(result !== null);
+  assert.ok(result.includes("Incomplete period \\(restart\\)"));
+  assert.ok(result.includes("1 observed event, partial"));
+  assert.ok(!result.includes("events in this cycle"));
 });

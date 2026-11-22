@@ -146,67 +146,34 @@ test("scheduler fires missed run once on restart", async () => {
   }
 });
 
-test("nextAllowedWindowStart & nextAllowedRun defer quiet-hours runs until allowed window", () => {
-  const quietHours = { window: { start: 22, end: 6 } };
-  const sameDayQuiet = { window: { start: "02:00", end: "06:00" } };
-
-  // 23:00 UTC -> deferred to next day 06:00 UTC
-  assert.strictEqual(
-    nextAllowedWindowStart(quietHours, Date.UTC(2024, 0, 1, 23, 0, 0)),
-    Date.UTC(2024, 0, 2, 6, 0, 0),
-  );
-  // 03:00 UTC -> deferred to same day 06:00 UTC
-  assert.strictEqual(
-    nextAllowedWindowStart(quietHours, Date.UTC(2024, 0, 2, 3, 0, 0)),
-    Date.UTC(2024, 0, 2, 6, 0, 0),
-  );
-  // Same-day window 02:00-06:00 at 04:00 -> 06:00
-  assert.strictEqual(
-    nextAllowedWindowStart(sameDayQuiet, Date.UTC(2024, 0, 2, 4, 0, 0)),
-    Date.UTC(2024, 0, 2, 6, 0, 0),
-  );
-  // Outside quiet hours -> unchanged
-  assert.strictEqual(
-    nextAllowedWindowStart(quietHours, Date.UTC(2024, 0, 2, 6, 0, 0)),
-    Date.UTC(2024, 0, 2, 6, 0, 0),
-  );
-  // Scheduled daily@02:00 from 00:00 -> deferred to 06:00
-  assert.strictEqual(
-    nextAllowedRun(parseSchedule("daily@02:00"), Date.UTC(2024, 0, 2, 0, 0, 0), quietHours),
-    Date.UTC(2024, 0, 2, 6, 0, 0),
-  );
-  // Invalid nowMs throws ScheduleParseError
-  assert.throws(
-    () => nextAllowedWindowStart(quietHours, Number.NaN),
-    ScheduleParseError,
-  );
-});
-
-test("scheduler with quietHours defers due digest until allowed window", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "test-schedule-quiet-"));
+test("scheduler reports complete context on normal tick and restart-incomplete context on catch-up", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "test-schedule-completeness-"));
   try {
     const store = new FileLastRunStore(join(dir, "last-run"));
-    const clock = fakeClock(Date.UTC(2024, 0, 1, 21, 0, 0));
-    const runs = [];
+    await store.write(Date.UTC(2024, 0, 1, 9, 0, 0));
+    const clock = fakeClock(Date.UTC(2024, 0, 3, 10, 0, 0));
+    const contexts = [];
     const scheduler = createScheduler({
-      schedule: "daily@02:00",
-      quietHours: { window: { start: 22, end: 6 } },
+      schedule: "daily@09:00",
       clock,
       lastRunStore: store,
-      run: (at) => {
-        runs.push(at);
+      run: (_at, context) => {
+        contexts.push(context);
       },
     });
     await scheduler.start();
-
-    // At 02:00 UTC (inside quiet hours), digest must NOT fire yet
-    await clock.advanceTo(Date.UTC(2024, 0, 2, 2, 30, 0));
-    assert.strictEqual(runs.length, 0);
-
-    // At 06:00 UTC (allowed window), deferred digest fires once
-    await clock.advanceTo(Date.UTC(2024, 0, 2, 6, 0, 0));
-    assert.strictEqual(runs.length, 1);
+    await clock.advanceTo(Date.UTC(2024, 0, 4, 10, 0, 0));
     await scheduler.stop();
+
+    assert.strictEqual(contexts.length, 2);
+    assert.deepStrictEqual(contexts[0], {
+      afterRestart: true,
+      completeness: { complete: false, reasons: ["restart"] },
+    });
+    assert.deepStrictEqual(contexts[1], {
+      afterRestart: false,
+      completeness: { complete: true, reasons: [] },
+    });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

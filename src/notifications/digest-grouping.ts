@@ -28,6 +28,88 @@ export interface DigestGroup {
   events: DecodedEvent[];
 }
 
+/** Reasons why a digest period does not have complete ledger coverage. */
+export type DigestIncompleteReason = "rpc_gap" | "restart";
+
+/** Explicit completeness metadata for a digest period. */
+export interface DigestPeriodCompleteness {
+  /** Whether the digest period has complete ledger coverage. */
+  complete: boolean;
+  /**
+   * Reasons why the period is incomplete.
+   * Always empty when `complete` is `true`.
+   */
+  reasons: DigestIncompleteReason[];
+}
+
+/** Grouped digest payload paired with explicit period completeness metadata. */
+export interface DigestPeriod {
+  groups: DigestGroup[];
+  eventCount: number;
+  completeness: DigestPeriodCompleteness;
+}
+
+const VALID_INCOMPLETE_REASONS = new Set<DigestIncompleteReason>(["rpc_gap", "restart"]);
+
+const REASON_LABELS: Record<DigestIncompleteReason, string> = {
+  rpc_gap: "RPC gap",
+  restart: "restart",
+};
+
+/**
+ * Normalize digest period completeness metadata.
+ *
+ * Deduplicates valid reasons in first-seen order and enforces the invariant
+ * that any period with one or more incomplete reasons is never marked complete.
+ */
+export function normalizeDigestCompleteness(
+  input?: Partial<DigestPeriodCompleteness>,
+): DigestPeriodCompleteness {
+  if (!input) {
+    return { complete: true, reasons: [] };
+  }
+
+  const reasons: DigestIncompleteReason[] = [];
+  if (Array.isArray(input.reasons)) {
+    for (const reason of input.reasons) {
+      if (VALID_INCOMPLETE_REASONS.has(reason) && !reasons.includes(reason)) {
+        reasons.push(reason);
+      }
+    }
+  }
+
+  const complete = reasons.length === 0 && input.complete !== false;
+  return { complete, reasons };
+}
+
+/**
+ * Format a human-readable label for an incomplete digest period, or `null`
+ * when the period is complete.
+ */
+export function formatCompletenessLabel(
+  completeness: Partial<DigestPeriodCompleteness>,
+): string | null {
+  const normalized = normalizeDigestCompleteness(completeness);
+  if (normalized.complete) return null;
+  if (normalized.reasons.length === 0) return "Incomplete period";
+  const detail = normalized.reasons.map((r) => REASON_LABELS[r]).join(", ");
+  return `Incomplete period (${detail})`;
+}
+
+/**
+ * Group `events` and attach normalized period completeness metadata.
+ */
+export function buildDigestPeriod(
+  events: readonly DecodedEvent[],
+  completeness?: Partial<DigestPeriodCompleteness>,
+): DigestPeriod {
+  return {
+    groups: groupDigestEvents(events),
+    eventCount: events.length,
+    completeness: normalizeDigestCompleteness(completeness),
+  };
+}
+
 /**
  * Derive the Group_Key for a single event.
  *
@@ -83,168 +165,102 @@ export function groupDigestEvents(events: readonly DecodedEvent[]): DigestGroup[
   return groups;
 }
 
-/** Default maximum number of deferred digest entries retained in memory. */
-export const DEFAULT_MAX_DIGEST_ENTRIES = 1000;
-
-export interface DigestDeferralOptions {
-  /** Quiet-hours policy used to decide when digests are deferred. */
-  policy?: QuietHoursPolicy;
-  /** Maximum number of deferred entries retained before excess entries are dropped. Defaults to 1000. */
-  maxEntries?: number;
-  /** Critical event names that always bypass quiet-hours deferral. Defaults to {@link DEFAULT_ALWAYS_SEND_EVENTS} when the policy does not specify one. */
-  alwaysSend?: Iterable<string>;
-}
-
-export interface DigestPartitionResult {
-  immediate: DecodedEvent[];
-  deferred: DecodedEvent[];
-}
-
-export interface DigestIngestResult {
-  immediate: DecodedEvent[];
-  deferredCount: number;
-  droppedCount: number;
-  bufferedCount: number;
-}
-
-export interface DigestFlushResult {
-  events: DecodedEvent[];
-  groups: DigestGroup[];
-  droppedCount: number;
-}
-
-function resolveEffectivePolicy(
-  policy: QuietHoursPolicy | undefined,
-  alwaysSend: Iterable<string> | undefined,
-): QuietHoursPolicy {
-  if (!policy) {
-    return { alwaysSend: alwaysSend ?? DEFAULT_ALWAYS_SEND_EVENTS };
-  }
-  const hasPolicyAlwaysSend =
-    policy.alwaysSend !== undefined ||
-    policy.alwaysSendEvents !== undefined ||
-    policy.alwaysSendEventNames !== undefined ||
-    policy.criticalEvents !== undefined;
-  if (alwaysSend !== undefined) {
-    return { ...policy, alwaysSend };
-  }
-  if (!hasPolicyAlwaysSend) {
-    return { ...policy, alwaysSend: DEFAULT_ALWAYS_SEND_EVENTS };
-  }
-  return policy;
-}
-
 /**
- * Partition `events` into `immediate` alerts (critical events or any event
- * outside quiet hours) and `deferred` digest candidates (non-critical events
- * arriving during quiet hours).
+ * A page within a multi-page digest.
  */
-export function partitionDigestEvents(
-  events: readonly DecodedEvent[],
-  policy: QuietHoursPolicy | undefined,
-  now: Date | number | string,
-  alwaysSend?: Iterable<string>,
-): DigestPartitionResult {
-  const effectivePolicy = resolveEffectivePolicy(policy, alwaysSend);
-  const immediate: DecodedEvent[] = [];
-  const deferred: DecodedEvent[] = [];
+export interface DigestPage<T = DigestGroup[]> {
+  /** 1-based page number */
+  pageNumber: number;
+  /** Total number of pages in the digest */
+  totalPages: number;
+  /** Items / groups belonging to this page */
+  items: T;
+}
 
-  for (const event of events) {
-    if (decide(event, effectivePolicy, now) === "defer") {
-      deferred.push(event);
-    } else {
-      immediate.push(event);
-    }
-  }
-
-  return { immediate, deferred };
+/** Options for paginating digest groups into pages. */
+export interface DigestPaginationOptions {
+  /** Maximum number of groups per page (must be > 0). */
+  maxGroupsPerPage?: number;
+  /** Maximum number of events per page across groups (must be > 0). */
+  maxEventsPerPage?: number;
 }
 
 /**
- * Bounded quiet-hours-aware digest deferral buffer.
+ * Paginate an array of DigestGroup into pages based on group or event limits.
  *
- * - Critical events (`alwaysSend`) are returned immediately by {@link ingest}
- *   even during quiet hours.
- * - Eligible non-critical events arriving during quiet hours are accumulated up
- *   to `maxEntries`; excess entries are dropped and counted.
- * - {@link flushIfAllowed} returns `null` while quiet hours are active, and
- *   drains + groups accumulated entries via {@link groupDigestEvents} once the
- *   allowed window opens.
+ * Each page is an array of DigestGroup. A group is kept intact on a single page
+ * unless a single group exceeds maxEventsPerPage by itself, in which case it forms
+ * its own page.
  */
-export class DigestDeferralBuffer {
-  readonly maxEntries: number;
-  private readonly effectivePolicy: QuietHoursPolicy;
-  private entries: DecodedEvent[] = [];
-  private _droppedCount = 0;
+export function paginateDigestGroups(
+  groups: readonly DigestGroup[],
+  options: DigestPaginationOptions | number,
+): DigestGroup[][] {
+  const maxGroups =
+    typeof options === "number"
+      ? options
+      : Math.max(1, options.maxGroupsPerPage ?? Number.MAX_SAFE_INTEGER);
+  const maxEvents =
+    typeof options === "object" && options.maxEventsPerPage !== undefined
+      ? Math.max(1, options.maxEventsPerPage)
+      : Number.MAX_SAFE_INTEGER;
 
-  constructor(options: DigestDeferralOptions = {}) {
-    const cap = options.maxEntries ?? DEFAULT_MAX_DIGEST_ENTRIES;
-    if (!Number.isInteger(cap) || cap < 0) {
-      throw new RangeError(`maxEntries must be a non-negative integer, got ${cap}`);
+  if (groups.length === 0) return [];
+  if (maxGroups <= 0) throw new RangeError("maxGroupsPerPage must be > 0");
+
+  const pages: DigestGroup[][] = [];
+  let currentPage: DigestGroup[] = [];
+  let currentEvents = 0;
+
+  for (const group of groups) {
+    const groupEvents = group.events.length;
+    const wouldExceedGroups = currentPage.length >= maxGroups;
+    const wouldExceedEvents =
+      currentPage.length > 0 && currentEvents + groupEvents > maxEvents;
+
+    if (wouldExceedGroups || wouldExceedEvents) {
+      pages.push(currentPage);
+      currentPage = [group];
+      currentEvents = groupEvents;
+    } else {
+      currentPage.push(group);
+      currentEvents += groupEvents;
     }
-    this.maxEntries = cap;
-    this.effectivePolicy = resolveEffectivePolicy(options.policy, options.alwaysSend);
   }
 
-  get size(): number {
-    return this.entries.length;
+  if (currentPage.length > 0) {
+    pages.push(currentPage);
   }
 
-  get droppedCount(): number {
-    return this._droppedCount;
-  }
-
-  peek(): readonly DecodedEvent[] {
-    return [...this.entries];
-  }
-
-  /**
-   * Evaluate `events` at `now`: return critical/allowed events in `immediate`
-   * and buffer eligible quiet-hours events up to `maxEntries`.
-   */
-  ingest(events: readonly DecodedEvent[], now: Date | number | string): DigestIngestResult {
-    const { immediate, deferred } = partitionDigestEvents(
-      events,
-      this.effectivePolicy,
-      now,
-    );
-
-    let deferredCount = 0;
-    let droppedInBatch = 0;
-    for (const event of deferred) {
-      if (this.entries.length >= this.maxEntries) {
-        this._droppedCount++;
-        droppedInBatch++;
-      } else {
-        this.entries.push(event);
-        deferredCount++;
-      }
-    }
-
-    return {
-      immediate,
-      deferredCount,
-      droppedCount: droppedInBatch,
-      bufferedCount: this.entries.length,
-    };
-  }
-
-  /**
-   * Flush and group buffered digest entries if `now` is in an allowed window.
-   * Returns `null` while quiet hours are active so digests remain deferred.
-   */
-  flushIfAllowed(now: Date | number | string): DigestFlushResult | null {
-    if (isInQuietHours(this.effectivePolicy, now)) {
-      return null;
-    }
-    const events = this.entries;
-    const droppedCount = this._droppedCount;
-    this.entries = [];
-    this._droppedCount = 0;
-    return {
-      events,
-      groups: groupDigestEvents(events),
-      droppedCount,
-    };
-  }
+  return pages;
 }
+
+/**
+ * Helper to construct a MultiPageDigestPayload from an id and an array of pages.
+ */
+export function createMultiPageDigest<T = string>(
+  id: string,
+  pages: readonly T[],
+): { id: string; pages: readonly T[] } {
+  return { id, pages };
+}
+
+// Re-export delivery and recovery utilities from schedule.js
+export type {
+  PageOutcomeStatus,
+  PageOutcomeRecord,
+  UncertainSend,
+  DigestDeliveryReport,
+  DigestJournalEntry,
+  DigestDeliveryStore,
+  FileDigestDeliveryStoreOptions,
+  MultiPageDigestPayload,
+  DeliverMultiPageDigestOptions,
+  RecoverMultiPageDigestOptions,
+} from "./schedule.js";
+
+export {
+  FileDigestDeliveryStore,
+  deliverMultiPageDigest,
+  recoverMultiPageDigest,
+} from "./schedule.js";
